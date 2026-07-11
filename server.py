@@ -3,6 +3,7 @@ import threading
 import os
 import random
 import struct
+import hashlib
 
 # Custom UDP Header (11 bytes header + Payload)
 # Format:
@@ -67,6 +68,7 @@ class ClientSession(threading.Thread):
         self.data_ip = None
         self.data_port = None
         self.data_sock = None  # Socket UDP dùng để truyền dữ liệu
+        self.rename_from_path = None # Trạng thái tạm thời cho RNFR/RNTO
 
     def run(self):
         print(f"[+] New Client connects from: {self.client_addr}")
@@ -93,12 +95,6 @@ class ClientSession(threading.Thread):
                     break
                 elif command == "NOOP":
                     self.send_response("200 Command OK\r\n")
-                if command == "PORT":
-                    self.handle_port(arg)
-                elif command == "PASV":
-                    self.handle_pasv()
-                if command == "LIST":
-                    self.handle_list(arg)
                 else:
                     # Chặn các lệnh khác nếu chưa đăng nhập
                     if not self.is_authenticated:
@@ -114,6 +110,26 @@ class ClientSession(threading.Thread):
                             self.handle_mkd(arg)
                         elif command == "RMD":
                             self.handle_rmd(arg)
+                        elif command == "PORT":
+                            self.handle_port(arg)
+                        elif command == "PASV":
+                            self.handle_pasv()
+                        elif command == "LIST":
+                            self.handle_list(arg)
+                        elif command == "RETR":
+                            self.handle_retr(arg)
+                        elif command == "STOR":
+                            self.handle_stor(arg)
+                        elif command == "HASH":
+                            self.handle_hash(arg)
+                        elif command == "SIZE":
+                            self.handle_size(arg)
+                        elif command == "DELE":
+                            self.handle_dele(arg)
+                        elif command == "RNFR":
+                            self.handle_rnfr(arg)
+                        elif command == "RNTO":
+                            self.handle_rnto(arg)
                         else:
                             self.send_response("502 Command not implemented\r\n")
         except ConnectionResetError:
@@ -275,7 +291,6 @@ class ClientSession(threading.Thread):
             print(f"File IO Error: {e}")
             return False
 
-    # LIST Command
     def handle_list(self, arg):
         """LIST: Gửi danh sách thư mục qua Data Channel"""
         target_path = self.current_dir
@@ -357,6 +372,122 @@ class ClientSession(threading.Thread):
             self.send_response("550 Directory not found\r\n")
         except OSError:
             self.send_response("550 Directory not empty or access denied\r\n")
+    
+    def handle_retr(self, filename):
+        """RETR (Retrieve): Download file from server to client"""
+        if not filename:
+            self.send_response("501 Syntax error in parameters\r\n")
+            return
+        filepath = os.path.abspath(os.path.join(self.current_dir, filename))
+        if not os.path.isfile(filepath):
+            self.send_response("550 File not found\r\n")
+            return
+        self.send_response(f"150 Opening binary mode data connection for {filename}\r\n")
+        try:
+            # Read the entire file into memory (For huge files, read in chunks inside rdt_send)
+            with open(filepath, 'rb') as f:
+                file_data = f.read()
+            if self.rdt_send(file_data):
+                self.send_response("226 Transfer complete\r\n")
+            else:
+                self.send_response("426 Connection closed; transfer aborted\r\n")
+        except IOError:
+            self.send_response("550 Error reading file\r\n")
+        finally:
+            if self.data_sock:
+                self.data_sock.close()
+                self.data_sock = None
+
+    def handle_stor(self, filename):
+        """STOR (Store): Upload file from client to server"""
+        if not filename:
+            self.send_response("501 Syntax error in parameters\r\n")
+            return
+        filepath = os.path.abspath(os.path.join(self.current_dir, filename))
+        self.send_response("150 Ok to send data\r\n")
+        if self.rdt_recv(filepath):
+            self.send_response("226 Transfer complete\r\n")
+        else:
+            self.send_response("426 Connection closed; transfer aborted\r\n")
+        if self.data_sock:
+            self.data_sock.close()
+            self.data_sock = None
+    
+    # Xác minh, quản lý File
+    def handle_hash(self, filename):
+        """HASH: Trả về SHA-256 của file để Client kiểm tra tính toàn vẹn"""
+        if not filename:
+            self.send_response("501 Syntax error in parameters.\r\n")
+            return
+        filepath = os.path.abspath(os.path.join(self.current_dir, filename))
+        if not os.path.isfile(filepath):
+            self.send_response("550 File not found.\r\n")
+            return
+        try:
+            sha256_hash = hashlib.sha256()
+            # Đọc file theo từng khối để tiết kiệm RAM với file dung lượng lớn
+            with open(filepath, "rb") as f:
+                for byte_block in iter(lambda: f.read(4096), b""):
+                    sha256_hash.update(byte_block)
+            hash_hex = sha256_hash.hexdigest()
+            self.send_response(f"213 SHA-256 {hash_hex}\r\n")
+        except IOError:
+            self.send_response("550 Error reading file for hashing.\r\n")
+
+    def handle_size(self, filename):
+        """SIZE: Trả về kích thước File"""
+        if not filename:
+            self.send_response("501 Syntax error in parameters.\r\n")
+            return
+        filepath = os.path.abspath(os.path.join(self.current_dir, filename))
+        if os.path.isfile(filepath):
+            file_size = os.path.getsize(filepath)
+            self.send_response(f"213 {file_size}\r\n")
+        else:
+            self.send_response("550 File not found.\r\n")
+
+    def handle_dele(self, filename):
+        """DELE: Xóa file trên server"""
+        if not filename:
+            self.send_response("501 Syntax error in parameters.\r\n")
+            return
+        filepath = os.path.abspath(os.path.join(self.current_dir, filename))
+        if os.path.isfile(filepath):
+            try:
+                os.remove(filepath)
+                self.send_response("250 Requested file action OK, file deleted.\r\n")
+            except OSError:
+                self.send_response("450 Requested file action not taken. File in use or access denied.\r\n")
+        else:
+            self.send_response("550 File not found.\r\n")
+
+    def handle_rnfr(self, filename):
+        """RNFR (Rename From): Chỉ định file cần đổi tên"""
+        if not filename:
+            self.send_response("501 Syntax error in parameters.\r\n")
+            return
+        filepath = os.path.abspath(os.path.join(self.current_dir, filename))
+        if os.path.isfile(filepath) or os.path.isdir(filepath):
+            self.rename_from_path = filepath
+            self.send_response("350 Requested file action pending further information (Send RNTO).\r\n")
+        else:
+            self.send_response("550 File or directory not found.\r\n")
+
+    def handle_rnto(self, filename):
+        """RNTO (Rename To): Hoàn tất đổi tên đã khởi tạo bởi RNFR"""
+        if not self.rename_from_path:
+            self.send_response("503 Bad sequence of commands. Send RNFR first.\r\n")
+            return
+        if not filename:
+            self.send_response("501 Syntax error in parameters.\r\n")
+            return
+        new_filepath = os.path.abspath(os.path.join(self.current_dir, filename))
+        try:
+            os.rename(self.rename_from_path, new_filepath)
+            self.rename_from_path = None  # Reset lại trạng thái
+            self.send_response("250 Requested file action OK, file renamed.\r\n")
+        except OSError:
+            self.send_response("553 Requested action not taken. File name not allowed.\r\n")
 
 def start_server():
     # Khởi tạo TCP Socket
