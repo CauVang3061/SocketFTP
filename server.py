@@ -28,7 +28,7 @@ def make_packet(seq_num, ack_num, flags, data=b""):
     # Gán checksum = 0 để tính toán lúc đầu
     header = struct.pack(HEADER_FORMAT, seq_num, ack_num, flags, 0)
     packet_without_checksum = header + data
-    checksum_val = 0 # calculate_checksum(packet_without_checksum) - function tạm
+    checksum_val = 0
     # Đóng gói lại với checksum thực tế
     final_header = struct.pack(HEADER_FORMAT, seq_num, ack_num, flags, checksum_val)
     return final_header + data
@@ -52,7 +52,7 @@ CONTROL_PORT = 2121  # Cổng cho Control Channel
 
 VALID_USERS = {
     "admin1": "123456",
-    "admin2": "654321"
+    "admin2": "654321",
 }
 
 class ClientSession(threading.Thread):
@@ -184,7 +184,7 @@ class ClientSession(threading.Thread):
     
     # Cú pháp: PORT h1,h2,h3,h4,p1,p2
     def handle_port(self, arg):
-        """Active Mode: Client gửi IP và Port đang lắng nghe"""
+        """Active Mode: Client gửi IP và Port đang chờ kết nối"""
         try:
             parts = arg.split(',')
             if len(parts) != 6:
@@ -342,7 +342,6 @@ class ClientSession(threading.Thread):
         except Exception as e:
             self.send_response("550 Error reading directory\r\n")
         finally:
-            # Đóng Data Socket sau khi truyền xong
             if self.data_sock:
                 self.data_sock.close()
                 self.data_sock = None
@@ -626,14 +625,14 @@ def start_server():
     try:
         server_sock.bind((HOST, CONTROL_PORT))
         server_sock.listen(5)
-        print(f"Server đang lắng nghe trên cổng TCP {CONTROL_PORT}...")
+        print(f"Server is hearing from port TCP {CONTROL_PORT}...")
         while True:
             client_sock, client_addr = server_sock.accept()
             # Khởi tạo một thread mới cho mỗi client để tách riêng từng session
             session = ClientSession(client_sock, client_addr)
             session.start()
     except KeyboardInterrupt:
-        print("\n[*] Đang tắt server...")
+        print("\n[*] Shut down server...")
     finally:
         server_sock.close()
 
