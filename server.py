@@ -4,6 +4,8 @@ import os
 import random
 import struct
 import hashlib
+import datetime
+import uuid
 
 # Custom UDP Header (11 bytes header + Payload)
 # Format:
@@ -69,6 +71,8 @@ class ClientSession(threading.Thread):
         self.data_port = None
         self.data_sock = None  # Socket UDP dùng để truyền dữ liệu
         self.rename_from_path = None # Trạng thái tạm thời cho RNFR/RNTO
+        self.transfer_type = 'A'  # Mặc định là 'A' (ASCII), có thể đổi sang 'I' (Image/Binary)
+        self.transfer_mode = 'S'  # Mặc định là 'S' (Stream)
 
     def run(self):
         print(f"[+] New Client connects from: {self.client_addr}")
@@ -130,6 +134,24 @@ class ClientSession(threading.Thread):
                             self.handle_rnfr(arg)
                         elif command == "RNTO":
                             self.handle_rnto(arg)
+                        elif command == "TYPE":
+                            self.handle_type(arg)
+                        elif command == "MODE":
+                            self.handle_mode(arg)
+                        elif command == "APPE":
+                            self.handle_appe(arg)
+                        elif command == "STOU":
+                            self.handle_stou()
+                        elif command == "NLST":
+                            self.handle_nlst(arg)
+                        elif command == "MDTM":
+                            self.handle_mdtm(arg)
+                        elif command == "STAT":
+                            self.handle_stat(arg)
+                        elif command == "HELP":
+                            self.handle_help(arg)
+                        elif command == "ABOR":
+                            self.send_response("226 Abort successful.\r\n")
                         else:
                             self.send_response("502 Command not implemented\r\n")
         except ConnectionResetError:
@@ -243,7 +265,7 @@ class ClientSession(threading.Thread):
             seq_num += 1
         return True
 
-    def rdt_recv(self, file_path):
+    def rdt_recv(self, file_path, write_mode='wb'):
         """Receives data over UDP and writes to disk (Stop-and-Wait)"""
         if not self.data_sock:
             self.send_response("425 Can't open data connection\r\n")
@@ -251,7 +273,7 @@ class ClientSession(threading.Thread):
         self.data_sock.settimeout(5.0)  # Wait up to 5s for incoming packets
         expected_seq = 1
         try:
-            with open(file_path, 'wb') as f:
+            with open(file_path, write_mode) as f:
                 while True:
                     try:
                         packet, addr = self.data_sock.recvfrom(2048)
@@ -488,6 +510,114 @@ class ClientSession(threading.Thread):
             self.send_response("250 Requested file action OK, file renamed.\r\n")
         except OSError:
             self.send_response("553 Requested action not taken. File name not allowed.\r\n")
+    
+    def handle_type(self, arg):
+        """TYPE: Đặt kiểu dữ liệu truyền tải (A = ASCII, I = Image/Binary)"""
+        if arg in ['A', 'I']:
+            self.transfer_type = arg
+            self.send_response(f"200 Type set to {arg}.\r\n")
+        else:
+            self.send_response("504 Command not implemented for that parameter.\r\n")
+
+    def handle_mode(self, arg):
+        """MODE: Đặt chế độ truyền tải (S = Stream, B = Block, C = Compressed)"""
+        if arg in ['S', 'B', 'C']:
+            self.transfer_mode = arg
+            self.send_response(f"200 Mode set to {arg}.\r\n")
+        else:
+            self.send_response("504 Command not implemented for that parameter.\r\n")
+
+    def handle_appe(self, filename):
+        """APPE: Upload và ghi nối tiếp vào cuối file (nếu chưa có thì tạo mới)"""
+        if not filename:
+            self.send_response("501 Syntax error in parameters.\r\n")
+            return
+        filepath = os.path.abspath(os.path.join(self.current_dir, filename))
+        self.send_response("150 Ok to send data, appending to file.\r\n")
+        # Gọi rdt_recv với mode 'ab' (append binary)
+        if self.rdt_recv(filepath, write_mode='ab'):
+            self.send_response("226 Transfer complete.\r\n")
+        else:
+            self.send_response("426 Connection closed; transfer aborted.\r\n")
+        if self.data_sock:
+            self.data_sock.close()
+            self.data_sock = None
+
+    def handle_stou(self):
+        """STOU: Upload file nhưng Server tự sinh tên file độc nhất để chống ghi đè"""
+        unique_filename = f"upload_{uuid.uuid4().hex[:8]}.dat"
+        filepath = os.path.abspath(os.path.join(self.current_dir, unique_filename))
+        self.send_response(f"150 FILE: {unique_filename}\r\n")
+        if self.rdt_recv(filepath, write_mode='wb'):
+            self.send_response("226 Transfer complete.\r\n")
+        else:
+            self.send_response("426 Connection closed; transfer aborted.\r\n")
+        if self.data_sock:
+            self.data_sock.close()
+            self.data_sock = None
+
+    def handle_nlst(self, arg):
+        """NLST: Trả về danh sách file rút gọn (chỉ có tên) qua Data Channel"""
+        target_path = self.current_dir
+        if arg:
+            target_path = os.path.abspath(os.path.join(self.current_dir, arg))
+        if not os.path.exists(target_path):
+            self.send_response("450 Requested action not taken. Directory unavailable.\r\n")
+            return
+        self.send_response("150 File status okay; about to open data connection.\r\n")
+        try:
+            listing = ""
+            for item in os.listdir(target_path):
+                listing += f"{item}\r\n"
+            payload = listing.encode('utf-8')
+            if self.rdt_send(payload):
+                self.send_response("226 Transfer complete.\r\n")
+            else:
+                self.send_response("426 Connection closed; transfer aborted.\r\n")
+        except Exception:
+            self.send_response("550 Error reading directory.\r\n")
+        finally:
+            if self.data_sock:
+                self.data_sock.close()
+                self.data_sock = None
+
+    def handle_mdtm(self, filename):
+        """MDTM: Trả về thời gian chỉnh sửa cuối cùng của file (Format: YYYYMMDDhhmmss)"""
+        if not filename:
+            self.send_response("501 Syntax error in parameters.\r\n")
+            return
+        filepath = os.path.abspath(os.path.join(self.current_dir, filename))
+        if os.path.isfile(filepath):
+            mtime = os.path.getmtime(filepath)
+            # Chuyển đổi timestamp sang định dạng YYYYMMDDhhmmss
+            dt = datetime.datetime.fromtimestamp(mtime)
+            formatted_time = dt.strftime('%Y%m%d%H%M%S')
+            self.send_response(f"213 {formatted_time}\r\n")
+        else:
+            self.send_response("550 File not found.\r\n")
+
+    def handle_stat(self, arg):
+        """STAT: Trả về trạng thái server qua kênh TCP"""
+        status_msg = (
+            f"211-Server Status:\r\n"
+            f" Logged in as: {self.username}\r\n"
+            f" Type: {self.transfer_type}, Mode: {self.transfer_mode}\r\n"
+            f" Data connection mode: {self.data_mode}\r\n"
+            f"211 End of status.\r\n"
+        )
+        self.send_response(status_msg)
+
+    def handle_help(self, arg):
+        """HELP: Trả về danh sách lệnh hỗ trợ"""
+        help_msg = (
+            "214-The following commands are recognized:\r\n"
+            " USER PASS QUIT NOOP PWD CWD CDUP MKD RMD\r\n"
+            " LIST NLST STAT SIZE MDTM TYPE MODE PORT\r\n"
+            " PASV RETR STOR STOU APPE DELE RNFR RNTO\r\n"
+            " HASH ABOR HELP\r\n"
+            "214 Help OK.\r\n"
+        )
+        self.send_response(help_msg)
 
 def start_server():
     # Khởi tạo TCP Socket
