@@ -94,7 +94,7 @@ class ClientSession(threading.Thread):
                     self.handle_user(arg)
                 elif command == "PASS":
                     self.handle_pass(arg)
-                if command == "QUIT":
+                elif command == "QUIT":
                     self.send_response("221 Goodbye\r\n")
                     break
                 elif command == "NOOP":
@@ -206,6 +206,8 @@ class ClientSession(threading.Thread):
         # Chọn một port UDP ngẫu nhiên từ 1024 đến 65535
         pasv_port = random.randint(1024, 65535)
         server_ip = self.control_sock.getsockname()[0]
+        if server_ip == '0.0.0.0':
+            server_ip = '127.0.0.1' # Tránh lỗi LocalHost
         if self.data_sock:
             self.data_sock.close()
         # Khởi tạo và Bind UDP Socket tại Server
