@@ -185,8 +185,14 @@ def main():
         elif command == "GET" and len(parts) > 1:
             filename = parts[1]
             if client.enter_passive_mode():
-                print(f"[Server] {client.send_command(f'RETR {filename}')}")
-                client.rdt_download(f"downloaded_{filename}")
+                resp = client.send_command(f'RETR {filename}')
+                print(f"[Server] {resp}")
+                # Chỉ tải khi Server báo 150
+                if resp.startswith("150"):
+                    client.rdt_download(f"downloaded_{filename}")
+                    print(f"[Server] {client.get_response()}")
+                else:
+                    print("[-] Download aborted by server!")
         elif command == "PUT" and len(parts) > 1:
             filename = parts[1]
             if not os.path.isfile(filename):
@@ -195,21 +201,29 @@ def main():
             if client.enter_passive_mode():
                 # Server mở file chờ sẵn
                 print(f"[Server] {client.send_command(f'STOR {filename}')}")
-                # Client bắt đầu băm file và đẩy qua luồng UDP
-                client.rdt_upload(filename)
+                print(f"[Server] {resp}")
+                if resp.startswith("150"):
+                    # Client bắt đầu băm file và đẩy qua luồng UDP
+                    client.rdt_upload(filename)
+                    print(f"[Server] {client.get_response()}")
+                else:
+                    print("[-] Upload aborted by server!")
         elif command == "LIST":
             if client.enter_passive_mode():
-                print(f"[Server] {client.send_command('LIST')}")
-                # Kênh RDT tải danh sách về dưới dạng một file ẩn
-                client.rdt_download(".temp_list.txt")
-                try:
-                    with open(".temp_list.txt", "r", encoding="utf-8") as f:
-                        print("\n--- List of Server ---")
-                        print(f.read())
-                        print("------------------------------\n")
-                    os.remove(".temp_list.txt") # Xóa file tạm sau khi in
-                except FileNotFoundError:
-                    pass
+                resp = client.send_command('LIST')
+                print(f"[Server] {resp}")
+                if resp.startswith("150"):
+                    # Kênh RDT tải danh sách về dưới dạng một file ẩn
+                    client.rdt_download(".temp_list.txt")
+                    print(f"[Server] {client.get_response()}")
+                    try:
+                        with open(".temp_list.txt", "r", encoding="utf-8") as f:
+                            print("\n--- List of Server ---")
+                            print(f.read())
+                            print("------------------------------\n")
+                        os.remove(".temp_list.txt") # Xóa file tạm sau khi in ra màn hình
+                    except FileNotFoundError:
+                        pass
         else:
             # Send standard commands directly to the control channel (USER, PASS, PWD, CWD, HASH)
             print(f"[Server] {client.send_command(cmd_input)}")
