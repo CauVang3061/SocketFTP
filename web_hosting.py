@@ -1,1 +1,1 @@
-# web hosing interface (placeholder only, more programming may be needed later for adjustment)
+# web_hosting interface (placeholder only, more programming on this file may be needed later for adjustment)

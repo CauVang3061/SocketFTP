@@ -59,6 +59,10 @@ class HybridFTPClient:
             # Setup the UDP Data Socket
             self.data_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.data_sock.settimeout(5.0)
+            syn_header = struct.pack(HEADER_FORMAT, 0, 0, FLAG_SYN, 0)
+            chksum = calculate_checksum(syn_header)
+            final_syn = struct.pack(HEADER_FORMAT, 0, 0, FLAG_SYN, chksum)
+            self.data_sock.sendto(final_syn, (self.data_ip, self.data_port))
             return True
         return False
     
@@ -108,6 +112,58 @@ class HybridFTPClient:
         finally:
             self.data_sock.close()
             self.data_sock = None
+    
+    def rdt_upload(self, local_filepath):
+        """Send file chunks over UDP using Stop-and-Wait."""
+        if not self.data_sock:
+            print("[-] Data connection not established. Run PASV first.")
+            return False
+        if not os.path.isfile(local_filepath):
+            print(f"[-] Local file not found: {local_filepath}")
+            return False
+        chunk_size = 1024
+        seq_num = 1
+        timeout = 2.0
+        self.data_sock.settimeout(timeout)
+        target_addr = (self.data_ip, self.data_port)
+        print(f"[*] Uploading {local_filepath} over UDP...")
+        try:
+            with open(local_filepath, 'rb') as f:
+                payload = f.read()
+            total_bytes = len(payload)
+            offset = 0
+            while offset < total_bytes:
+                is_last_chunk = (offset + chunk_size) >= total_bytes
+                flags = FLAG_DATA | FLAG_FIN if is_last_chunk else FLAG_DATA
+                chunk = payload[offset:offset + chunk_size]
+                # Đóng gói và tính Checksum
+                header = struct.pack(HEADER_FORMAT, seq_num, 0, flags, 0)
+                chksum = calculate_checksum(header + chunk)
+                final_packet = struct.pack(HEADER_FORMAT, seq_num, 0, flags, chksum) + chunk
+                max_retries = 3
+                attempts = 0
+                ack_received = False
+                while attempts < max_retries and not ack_received:
+                    try:
+                        self.data_sock.sendto(final_packet, target_addr)
+                        ack_data, _ = self.data_sock.recvfrom(1024)
+                        if len(ack_data) >= HEADER_SIZE:
+                            r_seq, r_ack, r_flags, r_chksum = struct.unpack(HEADER_FORMAT, ack_data[:HEADER_SIZE])
+                            if (r_flags & FLAG_ACK) and r_ack == seq_num:
+                                ack_received = True
+                    except socket.timeout:
+                        attempts += 1
+                        print(f"[RDT] Timeout! Resending Seq={seq_num}, Attempt {attempts}/{max_retries}")
+                if not ack_received:
+                    print("[-] Max retries exceeded. Upload aborted.")
+                    return False
+                offset += chunk_size
+                seq_num += 1
+            print("[+] Upload complete!")
+            return True
+        finally:
+            self.data_sock.close()
+            self.data_sock = None
 
 def main():
     client = HybridFTPClient('127.0.0.1')
@@ -131,6 +187,29 @@ def main():
             if client.enter_passive_mode():
                 print(f"[Server] {client.send_command(f'RETR {filename}')}")
                 client.rdt_download(f"downloaded_{filename}")
+        elif command == "PUT" and len(parts) > 1:
+            filename = parts[1]
+            if not os.path.isfile(filename):
+                print(f"[-] Local file not found: {filename}")
+                continue
+            if client.enter_passive_mode():
+                # Server mở file chờ sẵn
+                print(f"[Server] {client.send_command(f'STOR {filename}')}")
+                # Client bắt đầu băm file và đẩy qua luồng UDP
+                client.rdt_upload(filename)
+        elif command == "LIST":
+            if client.enter_passive_mode():
+                print(f"[Server] {client.send_command('LIST')}")
+                # Kênh RDT tải danh sách về dưới dạng một file ẩn
+                client.rdt_download(".temp_list.txt")
+                try:
+                    with open(".temp_list.txt", "r", encoding="utf-8") as f:
+                        print("\n--- List of Server ---")
+                        print(f.read())
+                        print("------------------------------\n")
+                    os.remove(".temp_list.txt") # Xóa file tạm sau khi in
+                except FileNotFoundError:
+                    pass
         else:
             # Send standard commands directly to the control channel (USER, PASS, PWD, CWD, HASH)
             print(f"[Server] {client.send_command(cmd_input)}")

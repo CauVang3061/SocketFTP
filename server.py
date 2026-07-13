@@ -229,6 +229,17 @@ class ClientSession(threading.Thread):
         if not self.data_sock or not self.data_ip or not self.data_port:
             self.send_response("425 Can't open data connection\r\n")
             return False
+        if self.data_mode == "PASSIVE":
+            print("[RDT] Waiting for Client to send SYN for detecting connection from Port...")
+            try:
+                self.data_sock.settimeout(5.0)
+                syn_packet, client_addr = self.data_sock.recvfrom(1024)
+                # Cập nhật đích đến là địa chỉ thực sự của Client
+                self.data_ip, self.data_port = client_addr
+                print(f"[RDT] Received SYN from {client_addr}. Sending the data...")
+            except socket.timeout:
+                print("[RDT] Cannot receive SYN from Client. Stop transmitting.")
+                return False
         chunk_size = 1024  # Safe payload size below standard MTU
         seq_num = 1
         timeout = 2.0
