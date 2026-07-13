@@ -72,6 +72,7 @@ class HybridFTPClient:
             print("[-] Data connection not established. Run PASV first.")
             return
         expected_seq = 1
+        success = False
         print(f"[*] Downloading to {local_filename} over UDP...")
         try:
             with open(local_filename, 'wb') as f:
@@ -112,6 +113,12 @@ class HybridFTPClient:
         finally:
             self.data_sock.close()
             self.data_sock = None
+            # Nếu tải không thành công, xóa bỏ file rác để giải phóng hệ thống
+            if not success and os.path.exists(local_filename):
+                os.remove(local_filename)
+                # Ẩn thông báo nếu nó chỉ là file tạm của lệnh LIST
+                if local_filename != ".temp_list.txt":
+                    print(f"[*] Finish emptying corrupted file: {local_filename}")
     
     def rdt_upload(self, local_filepath):
         """Send file chunks over UDP using Stop-and-Wait."""
@@ -200,7 +207,7 @@ def main():
                 continue
             if client.enter_passive_mode():
                 # Server mở file chờ sẵn
-                print(f"[Server] {client.send_command(f'STOR {filename}')}")
+                resp = client.send_command(f'STOR {filename}')
                 print(f"[Server] {resp}")
                 if resp.startswith("150"):
                     # Client bắt đầu băm file và đẩy qua luồng UDP
