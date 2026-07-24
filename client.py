@@ -77,39 +77,44 @@ class HybridFTPClient:
         try:
             with open(local_filename, 'wb') as f:
                 while True:
-                    try:
-                        packet, addr = self.data_sock.recvfrom(2048)
-                        if len(packet) < HEADER_SIZE:
-                            continue
-                        header_bytes = packet[:HEADER_SIZE]
-                        payload = packet[HEADER_SIZE:]
-                        r_seq, r_ack, r_flags, r_chksum = struct.unpack(HEADER_FORMAT, header_bytes)
-                        # Checksum verification
-                        temp_header = struct.pack(HEADER_FORMAT, r_seq, r_ack, r_flags, 0)
-                        if calculate_checksum(temp_header + payload) != r_chksum:
-                            print(f"[!] Corrupted packet Seq={r_seq}. Dropping.")
-                            continue
-                        # In-order packet processing
-                        if r_seq == expected_seq:
-                            f.write(payload)                            
-                            # Send ACK
-                            ack_header = struct.pack(HEADER_FORMAT, 0, expected_seq, FLAG_ACK, 0)
-                            ack_chksum = calculate_checksum(ack_header)
-                            final_ack = struct.pack(HEADER_FORMAT, 0, expected_seq, FLAG_ACK, ack_chksum)
-                            self.data_sock.sendto(final_ack, addr)
-                            if r_flags & FLAG_FIN:
-                                print(f"[+] Download complete: {local_filename}")
-                                break
-                            expected_seq += 1
-                        # Handle duplicated/delayed packets
-                        elif r_seq < expected_seq:
-                            ack_header = struct.pack(HEADER_FORMAT, 0, r_seq, FLAG_ACK, 0)
-                            ack_chksum = calculate_checksum(ack_header)
-                            final_ack = struct.pack(HEADER_FORMAT, 0, r_seq, FLAG_ACK, ack_chksum)
-                            self.data_sock.sendto(final_ack, addr)
-                    except socket.timeout:
-                        print("[-] UDP Timeout waiting for server data.")
-                        break
+                    packet, addr = self.data_sock.recvfrom(2048)
+                    if len(packet) < HEADER_SIZE:
+                        continue
+                    header_bytes = packet[:HEADER_SIZE]
+                    payload = packet[HEADER_SIZE:]
+                    r_seq, r_ack, r_flags, r_chksum = struct.unpack(HEADER_FORMAT, header_bytes)
+                    # Checksum verification
+                    temp_header = struct.pack(HEADER_FORMAT, r_seq, r_ack, r_flags, 0)
+                    if calculate_checksum(temp_header + payload) != r_chksum:
+                        print(f"[!] Corrupted packet Seq={r_seq}. Dropping.")
+                        continue
+                    # In-order packet processing
+                    if r_seq == expected_seq:
+                        f.write(payload)                            
+                        # Send ACK
+                        ack_header = struct.pack(HEADER_FORMAT, 0, expected_seq, FLAG_ACK, 0)
+                        ack_chksum = calculate_checksum(ack_header)
+                        final_ack = struct.pack(HEADER_FORMAT, 0, expected_seq, FLAG_ACK, ack_chksum)
+                        self.data_sock.sendto(final_ack, addr)
+                        if r_flags & FLAG_FIN:
+                            print(f"[+] Download complete: {local_filename}")
+                            success = True
+                            break
+                        expected_seq += 1
+                    # Handle duplicated/delayed packets
+                    elif r_seq < expected_seq:
+                        ack_header = struct.pack(HEADER_FORMAT, 0, r_seq, FLAG_ACK, 0)
+                        ack_chksum = calculate_checksum(ack_header)
+                        final_ack = struct.pack(HEADER_FORMAT, 0, r_seq, FLAG_ACK, ack_chksum)
+                        self.data_sock.sendto(final_ack, addr)
+        except KeyboardInterrupt:
+            print("\n[*] Abort requested by user! Sending ABOR to server...")
+            resp = self.send_command("ABOR")
+            print(f"[Server] {resp}")
+            success = False
+        except socket.timeout:
+            print("[-] UDP Timeout waiting for server data.")
+            success = False
         finally:
             self.data_sock.close()
             self.data_sock = None
@@ -120,7 +125,7 @@ class HybridFTPClient:
                 if local_filename != ".temp_list.txt":
                     print(f"[*] Finish emptying corrupted file: {local_filename}")
     
-    def rdt_upload(self, local_filepath):
+    def rdt_upload(self, local_filepath, is_active_mode=False):
         """Send file chunks over UDP using Stop-and-Wait."""
         if not self.data_sock:
             print("[-] Data connection not established. Run PASV first.")
@@ -132,14 +137,34 @@ class HybridFTPClient:
         seq_num = 1
         timeout = 2.0
         self.data_sock.settimeout(timeout)
-        target_addr = (self.data_ip, self.data_port)
+        if is_active_mode:
+            print("[*] Active Mode: Waiting for Server to initiate UDP connection...")
+            try:
+                # Wait for the Server's SYN packet
+                syn_data, server_addr = self.data_sock.recvfrom(1024)
+                print(f"[+] Received UDP ping from Server: {server_addr}")
+                # Reassign the target address to the Server's actual UDP port
+                target_addr = server_addr
+            except KeyboardInterrupt:
+                print("\n[*] Abort requested by user! Sending ABOR to server...")
+                resp = self.send_command("ABOR")
+                print(f"[Server] {resp}")
+            except socket.timeout:
+                print("[-] Timeout waiting for Server UDP SYN.")
+                self.data_sock.close()
+                self.data_sock = None
+                return False
+        else:
+            # Passive Mode: The client already knows where to send
+            target_addr = (self.data_ip, self.data_port)
+
         print(f"[*] Uploading {local_filepath} over UDP...")
         try:
             with open(local_filepath, 'rb') as f:
                 payload = f.read()
             total_bytes = len(payload)
             offset = 0
-            while offset < total_bytes:
+            while True:
                 is_last_chunk = (offset + chunk_size) >= total_bytes
                 flags = FLAG_DATA | FLAG_FIN if is_last_chunk else FLAG_DATA
                 chunk = payload[offset:offset + chunk_size]
@@ -166,8 +191,14 @@ class HybridFTPClient:
                     return False
                 offset += chunk_size
                 seq_num += 1
+                if offset >= total_bytes:
+                    break
             print("[+] Upload complete!")
             return True
+        except KeyboardInterrupt:
+            print("\n[*] Abort requested by user! Sending ABOR to server...")
+            resp = self.send_command("ABOR")
+            print(f"[Server] {resp}")
         finally:
             self.data_sock.close()
             self.data_sock = None
@@ -183,6 +214,8 @@ def main():
         cmd_input = input("ftp> ").strip()
         if not cmd_input:
             continue
+        if not hasattr(client, 'active_mode'):
+            client.active_mode = False
         parts = cmd_input.split(' ', 1)
         command = parts[0].upper()
         if command == "QUIT":
@@ -215,9 +248,48 @@ def main():
                     print(f"[Server] {client.get_response()}")
                 else:
                     print("[-] Upload aborted by server!")
-        elif command == "LIST":
+        elif command == "RETR" and len(parts) > 1:
+            filename = parts[1]
+            # Send TCP command
+            resp = client.send_command(cmd_input)
+            print(f"[Server] {resp}")
+            # If server agrees (150), activate the UDP listening loop!
+            if resp.startswith("150"):
+                client.rdt_download(f"downloaded_{filename}")
+                # Get the final 226 Transfer complete message over TCP
+                print(f"[Server] {client.get_response()}")
+        elif command in ["STOR", "APPE"] and len(parts) > 1:
+            filename = parts[1]
+            if not os.path.isfile(filename):
+                print(f"[-] Local file not found: {filename}")
+                continue
+            resp = client.send_command(cmd_input)
+            print(f"[Server] {resp}")
+            if resp.startswith("150"):
+                client.rdt_upload(filename, is_active_mode=client.active_mode)
+                print(f"[Server] {client.get_response()}")
+        elif command == "STOU":
+            # 1. Determine which local file the user wants to upload
+            if len(parts) > 1:
+                local_filename = parts[1]
+            else:
+                # If they just typed 'STOU', prompt them for the local file
+                local_filename = input("Local file to upload: ").strip()
+            if not os.path.isfile(local_filename):
+                print(f"[-] Local file not found: {local_filename}")
+                continue
+            # 2. Send the STOU command to the Server over TCP
+            # (We only send "STOU" because the server generates the remote filename)
+            resp = client.send_command("STOU")
+            print(f"[Server] {resp}")
+            # 3. If Server approves (150), fire up the UDP Data Channel
+            if resp.startswith("150"):
+                client.rdt_upload(local_filename, is_active_mode=client.active_mode)
+                # 4. Read the final 226 or 426 response over TCP
+                print(f"[Server] {client.get_response()}")
+        elif command in ["LIST", "NLST"]:
             if client.enter_passive_mode():
-                resp = client.send_command('LIST')
+                resp = client.send_command(cmd_input)
                 print(f"[Server] {resp}")
                 if resp.startswith("150"):
                     # Kênh RDT tải danh sách về dưới dạng một file ẩn
@@ -231,6 +303,27 @@ def main():
                         os.remove(".temp_list.txt") # Xóa file tạm sau khi in ra màn hình
                     except FileNotFoundError:
                         pass
+        elif command == "PASV":
+            if client.enter_passive_mode():
+                print("[+] UDP Data Channel successfully prepared and SYN packet sent!")
+                client.active_mode = False
+            else:
+                print("[-] Failed to enter Passive Mode.")
+        elif command == "PORT" and len(parts) > 1:
+            # Send the PORT command to the server first
+            resp = client.send_command(cmd_input)
+            print(f"[Server] {resp}")
+            
+            if resp.startswith("200"):
+                p_parts = parts[1].split(',')
+                client.data_ip = f"{p_parts[0]}.{p_parts[1]}.{p_parts[2]}.{p_parts[3]}"
+                client.data_port = (int(p_parts[4]) * 256) + int(p_parts[5])
+                
+                # Create and BIND the socket for Active Mode listening
+                client.data_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                client.data_sock.bind(('0.0.0.0', client.data_port))
+                client.active_mode = True
+                print(f"[+] Active Mode UDP socket bound and listening on port {client.data_port}")
         else:
             # Send standard commands directly to the control channel (USER, PASS, PWD, CWD, HASH)
             print(f"[Server] {client.send_command(cmd_input)}")

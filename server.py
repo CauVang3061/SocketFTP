@@ -5,6 +5,7 @@ import random
 import struct
 import hashlib
 import datetime
+import select
 import uuid
 
 # Custom UDP Header (11 bytes header + Payload)
@@ -64,7 +65,10 @@ class ClientSession(threading.Thread):
         # Trạng thái session
         self.is_authenticated = False
         self.username = ""
-        self.current_dir = os.getcwd()
+        self.base_dir = os.path.abspath(os.getcwd())  # Giới hạn thư mục gốc cho FTP
+        self.current_dir = self.base_dir  # Thư mục hiện tại, mặc định là thư mục gốc
+        self.client_data_ip = None  # IP của Client cho Data Channel (Active Mode)
+        self.client_data_port = None  # Port của Client cho Data Channel (Active Mode)
         # Thông tin Data Channel (UDP)
         self.data_mode = None  # 'ACTIVE' hoặc 'PASSIVE'
         self.data_ip = None
@@ -90,6 +94,8 @@ class ClientSession(threading.Thread):
                 command = parts[0].upper()
                 arg = parts[1].strip() if len(parts) > 1 else ""
                 # Định nghĩa các lệnh cơ bản của FTP
+                if command != "RNTO":
+                    self.rename_from_path = None
                 if command == "USER":
                     self.handle_user(arg)
                 elif command == "PASS":
@@ -159,6 +165,9 @@ class ClientSession(threading.Thread):
         finally:
             print(f"[*] Stop session: {self.client_addr}")
             self.control_sock.close()
+            if self.data_sock: # Fix zombie socket on data sock
+                self.data_sock.close()
+                self.data_sock = None
 
     def send_response(self, message):
         """Hàm hỗ trợ gửi phản hồi về client"""
@@ -189,15 +198,22 @@ class ClientSession(threading.Thread):
             parts = arg.split(',')
             if len(parts) != 6:
                 raise ValueError
-            # Tính toán lại IP và Port
-            self.data_ip = f"{parts[0]}.{parts[1]}.{parts[2]}.{parts[3]}"
-            self.data_port = (int(parts[4]) * 256) + int(parts[5])
+            
+            # Lưu vào đúng biến client_data_ip và client_data_port!
+            self.client_data_ip = f"{parts[0]}.{parts[1]}.{parts[2]}.{parts[3]}"
+            self.client_data_port = (int(parts[4]) * 256) + int(parts[5])
+            self.data_ip = self.client_data_ip
+            self.data_port = self.client_data_port
             self.data_mode = "ACTIVE"
+            
             # Tạo sẵn UDP Socket cho Server
             if self.data_sock:
                 self.data_sock.close()
             self.data_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            
             self.send_response("200 PORT command successful\r\n")
+            print(f"[*] Active Mode requested. Client UDP at {self.client_data_ip}:{self.client_data_port}")
+            
         except ValueError:
             self.send_response("501 Syntax error in parameters\r\n")
 
@@ -205,7 +221,7 @@ class ClientSession(threading.Thread):
         """Passive Mode: Server mở một Port ngẫu nhiên và báo cho Client"""
         # Chọn một port UDP ngẫu nhiên từ 1024 đến 65535
         pasv_port = random.randint(1024, 65535)
-        server_ip = self.control_sock.getsockname()[0]
+        server_ip = self.control_sock.getsockname()[0]  # Lấy IP của Server từ Control Socket
         if server_ip == '0.0.0.0':
             server_ip = '127.0.0.1' # Tránh lỗi LocalHost
         if self.data_sock:
@@ -240,6 +256,7 @@ class ClientSession(threading.Thread):
             except socket.timeout:
                 print("[RDT] Cannot receive SYN from Client. Stop transmitting.")
                 return False
+
         chunk_size = 1024  # Safe payload size below standard MTU
         seq_num = 1
         timeout = 2.0
@@ -247,90 +264,156 @@ class ClientSession(threading.Thread):
         target_addr = (self.data_ip, self.data_port)
         total_bytes = len(payload)
         offset = 0
-        while offset < total_bytes:
+
+        # Stop-and-Wait transmission loop for the current chunk
+        while True:
             is_last_chunk = (offset + chunk_size) >= total_bytes
             flags = FLAG_DATA | FLAG_FIN if is_last_chunk else FLAG_DATA
             chunk = payload[offset:offset + chunk_size]
-            # Pack Header and Checksum
+
             header = struct.pack(HEADER_FORMAT, seq_num, 0, flags, 0)
             chksum = calculate_checksum(header + chunk)
             final_packet = struct.pack(HEADER_FORMAT, seq_num, 0, flags, chksum) + chunk
+
             max_retries = 3
             attempts = 0
             ack_received = False
-            # Stop-and-Wait transmission loop for the current chunk
+
             while attempts < max_retries and not ack_received:
-                try:
-                    self.data_sock.sendto(final_packet, target_addr)
-                    # Wait for ACK
-                    ack_data, _ = self.data_sock.recvfrom(1024)
-                    if len(ack_data) >= HEADER_SIZE:
-                        r_seq, r_ack, r_flags, r_chksum = struct.unpack(HEADER_FORMAT, ack_data[:HEADER_SIZE])
-                        if (r_flags & FLAG_ACK) and r_ack == seq_num:
-                            ack_received = True
-                except socket.timeout:
+                self.data_sock.sendto(final_packet, target_addr)
+
+                # --- MULTIPLEX CONTROL AND DATA SOCKETS ---
+                # This waits for EITHER an Abort on TCP or an ACK on UDP
+                r_sockets, _, _ = select.select([self.control_sock, self.data_sock], [], [], timeout)
+
+                # If 2 seconds pass with no data on either socket
+                if not r_sockets:
                     attempts += 1
                     print(f"[RDT] Timeout! Resending Seq={seq_num}, Attempt {attempts}/{max_retries}")
+                    continue
+
+                for sock in r_sockets:
+                    # CASE A: Client sent ABOR over TCP Control Socket
+                    if sock == self.control_sock:
+                        try:
+                            tcp_data = self.control_sock.recv(1024).decode('utf-8').strip()
+                            if "ABOR" in tcp_data.upper():
+                                print("[*] ABOR received! Stopping UDP send stream instantly.")
+                                self.send_response("426 Connection closed; transfer aborted.\r\n")
+                                return False
+                        except Exception:
+                            return False
+
+                    # CASE B: ACK received over UDP Data Socket
+                    elif sock == self.data_sock:
+                        ack_data, _ = self.data_sock.recvfrom(1024)
+                        if len(ack_data) >= HEADER_SIZE:
+                            r_seq, r_ack, r_flags, r_chksum = struct.unpack(HEADER_FORMAT, ack_data[:HEADER_SIZE])
+                            if (r_flags & FLAG_ACK) and r_ack == seq_num:
+                                ack_received = True
+
             if not ack_received:
                 print("[RDT] Max retries exceeded. Aborting transfer.")
                 return False
+
             offset += chunk_size
             seq_num += 1
+
+            if offset >= total_bytes:
+                break
         return True
 
     def rdt_recv(self, file_path, write_mode='wb'):
-        """Receives data over UDP and writes to disk (Stop-and-Wait)"""
+        """Receives data over UDP and writes to disk (Stop-and-Wait with Asynchronous Abort)"""
         if not self.data_sock:
             self.send_response("425 Can't open data connection\r\n")
             return False
-        self.data_sock.settimeout(5.0)  # Wait up to 5s for incoming packets
         expected_seq = 1
         try:
             with open(file_path, write_mode) as f:
                 while True:
-                    try:
-                        packet, addr = self.data_sock.recvfrom(2048)
-                        if len(packet) < HEADER_SIZE:
-                            continue
-                        # Unpack header
-                        header_bytes = packet[:HEADER_SIZE]
-                        payload = packet[HEADER_SIZE:]
-                        r_seq, r_ack, r_flags, r_chksum = struct.unpack(HEADER_FORMAT, header_bytes)
-                        # Verify Checksum
-                        temp_header = struct.pack(HEADER_FORMAT, r_seq, r_ack, r_flags, 0)
-                        if calculate_checksum(temp_header + payload) != r_chksum:
-                            print(f"[RDT] Checksum failed for Seq={r_seq}. Dropping packet.")
-                            continue # Ignore corrupted packet, let sender timeout
-                        # Process in-order packet
-                        if r_seq == expected_seq:
-                            f.write(payload)
-                            # Send ACK back
-                            ack_header = struct.pack(HEADER_FORMAT, 0, expected_seq, FLAG_ACK, 0)
-                            ack_chksum = calculate_checksum(ack_header)
-                            final_ack = struct.pack(HEADER_FORMAT, 0, expected_seq, FLAG_ACK, ack_chksum)
-                            self.data_sock.sendto(final_ack, addr)
-                            if r_flags & FLAG_FIN:
-                                return True # End of file received successfully
-                            expected_seq += 1
-                        # Handle duplicate/delayed packets (Client re-sent because our ACK was lost)
-                        elif r_seq < expected_seq:
-                            # Re-ACK the old packet so the sender can move forward
-                            ack_header = struct.pack(HEADER_FORMAT, 0, r_seq, FLAG_ACK, 0)
-                            ack_chksum = calculate_checksum(ack_header)
-                            final_ack = struct.pack(HEADER_FORMAT, 0, r_seq, FLAG_ACK, ack_chksum)
-                            self.data_sock.sendto(final_ack, addr)
-                    except socket.timeout:
+                    # --- MULTIPLEX BOTH SOCKETS ---
+                    # select will wait up to 5.0 seconds for ANY activity on either socket
+                    r_sockets, _, _ = select.select([self.control_sock, self.data_sock], [], [], 5.0)
+                    
+                    # If r_sockets is empty, it means 5.0 seconds passed with absolutely no data
+                    if not r_sockets:
                         print("[RDT] Timeout waiting for data packets.")
                         return False
+                        
+                    for sock in r_sockets:
+                        # CASE 1: The TCP Control Channel has an incoming message (Abort or Disconnect)
+                        if sock == self.control_sock:
+                            try:
+                                tcp_data = self.control_sock.recv(1024).decode('utf-8').strip()
+                                if not tcp_data:
+                                    print("[-] Client disconnected abruptly. Stopping UDP engine.")
+                                    return False
+                                    
+                                if "ABOR" in tcp_data.upper():
+                                    print("[*] Asynchronous ABOR received! Aborting UDP receive stream.")
+                                    self.send_response("426 Connection closed; transfer aborted.\r\n")
+                                    return False
+                            except ConnectionResetError:
+                                print(f"[-] Client process was abruptly killed (Connection Reset). Stopping UDP engine.")
+                                return False
+                            except Exception as e:
+                                print(f"[-] Control socket error: {e}")
+                                return False
+                                
+                        # CASE 2: The UDP Data Channel has an incoming data packet
+                        elif sock == self.data_sock:
+                            packet, addr = self.data_sock.recvfrom(2048)
+                            if len(packet) < HEADER_SIZE:
+                                continue
+                                
+                            # Unpack header
+                            header_bytes = packet[:HEADER_SIZE]
+                            payload = packet[HEADER_SIZE:]
+                            r_seq, r_ack, r_flags, r_chksum = struct.unpack(HEADER_FORMAT, header_bytes)
+                            
+                            # Verify Checksum
+                            temp_header = struct.pack(HEADER_FORMAT, r_seq, r_ack, r_flags, 0)
+                            if calculate_checksum(temp_header + payload) != r_chksum:
+                                print(f"[RDT] Checksum failed for Seq={r_seq}. Dropping packet.")
+                                continue 
+                                
+                            # Process in-order packet
+                            if r_seq == expected_seq:
+                                f.write(payload)
+                                
+                                # Send ACK back
+                                ack_header = struct.pack(HEADER_FORMAT, 0, expected_seq, FLAG_ACK, 0)
+                                ack_chksum = calculate_checksum(ack_header)
+                                final_ack = struct.pack(HEADER_FORMAT, 0, expected_seq, FLAG_ACK, ack_chksum)
+                                self.data_sock.sendto(final_ack, addr)
+                                
+                                if r_flags & FLAG_FIN:
+                                    return True # End of file received successfully
+                                expected_seq += 1
+                                
+                            # Handle duplicate/delayed packets
+                            elif r_seq < expected_seq:
+                                ack_header = struct.pack(HEADER_FORMAT, 0, r_seq, FLAG_ACK, 0)
+                                ack_chksum = calculate_checksum(ack_header)
+                                final_ack = struct.pack(HEADER_FORMAT, 0, r_seq, FLAG_ACK, ack_chksum)
+                                self.data_sock.sendto(final_ack, addr)
+                                
         except Exception as e:
             print(f"File IO Error: {e}")
             return False
 
     def handle_list(self, arg):
         """LIST: Gửi danh sách thư mục qua Data Channel"""
+        if not self.data_sock:
+            self.send_response("425 Use PORT or PASV first.\r\n")
+            return
         target_path = self.current_dir
         if arg:
             target_path = os.path.abspath(os.path.join(self.current_dir, arg))
+        if not target_path.startswith(self.base_dir):
+            self.send_response("550 Requested action not taken. Access denied\r\n")
+            return
         if not os.path.exists(target_path):
             self.send_response("450 Requested file action not taken. File/Directory unavailable\r\n")
             return
@@ -343,9 +426,23 @@ class ClientSession(threading.Thread):
                 full_path = os.path.join(target_path, item)
                 size = os.path.getsize(full_path)
                 item_type = "d" if os.path.isdir(full_path) else "-"
-                # Định dạng đơn giản: loại, kích thước, tên file
-                listing += f"{item_type}rw-r--r-- 1 ftp ftp {size:>8} {item}\r\n"
+                # Lấy thời gian chỉnh sửa cuối cùng của file/thư mục
+                mtime = os.path.getmtime(full_path)
+                date_str = datetime.datetime.fromtimestamp(mtime).strftime('%b %d %H:%M')
+                
+                # Phân biệt quyền hệ thống chuẩn UNIX (Quyền 'x' cho thư mục)
+                if os.path.isdir(full_path):
+                    item_type = "d"
+                    perms = "rwxr-xr-x"
+                else:
+                    item_type = "-"
+                    perms = "rw-r--r--"
+                
+                # Định dạng chuẩn UNIX: Loại/Quyền, Links, User, Group, Kích thước, Ngày/Giờ, Tên
+                listing += f"{item_type}{perms} 1 ftp ftp {size:>8} {date_str} {item}\r\n"
             payload = listing.encode('utf-8')
+            if not payload:
+                payload = b"(Empty directory)\r\n"
             # 3. Gửi danh sách qua UDP
             success = self.rdt_send(payload)
             if success:
@@ -373,6 +470,9 @@ class ClientSession(threading.Thread):
         # Nếu cho phép nối đuôi trực tiếp, user nhập: ../../../../etc, Linux trả về /etc, tức là đã thoát ra khỏi thư mục cho phép
         # Xử lý abspath (bỏ ..): home/ftp/etc
         target_dir = os.path.abspath(os.path.join(self.current_dir, path))
+        if not target_dir.startswith(self.base_dir):
+            self.send_response("550 Requested action not taken. Access denied\r\n")
+            return
         if os.path.isdir(target_dir):
             self.current_dir = target_dir
             self.send_response("250 Requested file action OK, directory changed\r\n")
@@ -385,6 +485,9 @@ class ClientSession(threading.Thread):
             self.send_response("501 Syntax error in parameters\r\n")
             return
         target_dir = os.path.abspath(os.path.join(self.current_dir, dirname))
+        if not target_dir.startswith(self.base_dir):
+            self.send_response("550 Requested action not taken. Access denied\r\n")
+            return
         try:
             os.makedirs(target_dir, exist_ok=False)
             self.send_response(f'257 "{target_dir}" directory created\r\n')
@@ -399,6 +502,9 @@ class ClientSession(threading.Thread):
             self.send_response("501 Syntax error in parameters\r\n")
             return
         target_dir = os.path.abspath(os.path.join(self.current_dir, dirname))
+        if not target_dir.startswith(self.base_dir):
+            self.send_response("550 Requested action not taken. Access denied\r\n")
+            return
         try:
             os.rmdir(target_dir) # rmdir chỉ xóa thư mục rỗng
             self.send_response("250 Requested file action OK, directory removed\r\n")
@@ -412,9 +518,15 @@ class ClientSession(threading.Thread):
         if not filename:
             self.send_response("501 Syntax error in parameters\r\n")
             return
+        if not self.data_sock:
+            self.send_response("425 Use PORT or PASV first.\r\n")
+            return
         filepath = os.path.abspath(os.path.join(self.current_dir, filename))
         if not os.path.isfile(filepath):
             self.send_response("550 File not found\r\n")
+            return
+        if not filepath.startswith(self.base_dir):
+            self.send_response("550 Requested action not taken. Access denied\r\n")
             return
         self.send_response(f"150 Opening binary mode data connection for {filename}\r\n")
         try:
@@ -437,9 +549,31 @@ class ClientSession(threading.Thread):
         if not filename:
             self.send_response("501 Syntax error in parameters\r\n")
             return
+        if not self.data_sock:
+            self.send_response("425 Use PORT or PASV first.\r\n")
+            return
         filepath = os.path.abspath(os.path.join(self.current_dir, filename))
+        if not filepath.startswith(self.base_dir):
+            self.send_response("550 Requested action not taken. Access denied\r\n")
+            return
+        parent_dir = os.path.dirname(filepath)
+        
+        # Check if that folder actually exists on the server's hard drive
+        if not os.path.exists(parent_dir) or not os.path.isdir(parent_dir):
+            self.send_response("550 Requested action not taken. File unavailable (Directory not found).\r\n")
+            return  
+        
+        if self.data_mode == 'ACTIVE':
+            # Sử dụng self.data_sock đã được tạo trong handle_port
+            syn_header = struct.pack(HEADER_FORMAT, 0, 0, FLAG_SYN, 0)
+            chksum = calculate_checksum(syn_header)
+            final_syn = struct.pack(HEADER_FORMAT, 0, 0, FLAG_SYN, chksum)
+            
+            print(f"[*] Firing Active Mode SYN to Client at {self.client_data_ip}:{self.client_data_port}")
+            self.data_sock.sendto(final_syn, (self.client_data_ip, self.client_data_port))
+
         self.send_response("150 Ok to send data\r\n")
-        if self.rdt_recv(filepath):
+        if self.rdt_recv(filepath, write_mode='wb'):
             self.send_response("226 Transfer complete\r\n")
         else:
             self.send_response("426 Connection closed; transfer aborted\r\n")
@@ -454,6 +588,9 @@ class ClientSession(threading.Thread):
             self.send_response("501 Syntax error in parameters.\r\n")
             return
         filepath = os.path.abspath(os.path.join(self.current_dir, filename))
+        if not filepath.startswith(self.base_dir):
+            self.send_response("550 Requested action not taken. Access denied\r\n")
+            return
         if not os.path.isfile(filepath):
             self.send_response("550 File not found.\r\n")
             return
@@ -474,6 +611,9 @@ class ClientSession(threading.Thread):
             self.send_response("501 Syntax error in parameters.\r\n")
             return
         filepath = os.path.abspath(os.path.join(self.current_dir, filename))
+        if not filepath.startswith(self.base_dir):
+            self.send_response("550 Requested action not taken. Access denied\r\n")
+            return
         if os.path.isfile(filepath):
             file_size = os.path.getsize(filepath)
             self.send_response(f"213 {file_size}\r\n")
@@ -486,6 +626,9 @@ class ClientSession(threading.Thread):
             self.send_response("501 Syntax error in parameters.\r\n")
             return
         filepath = os.path.abspath(os.path.join(self.current_dir, filename))
+        if not filepath.startswith(self.base_dir):
+            self.send_response("550 Requested action not taken. Access denied\r\n")
+            return
         if os.path.isfile(filepath):
             try:
                 os.remove(filepath)
@@ -501,6 +644,9 @@ class ClientSession(threading.Thread):
             self.send_response("501 Syntax error in parameters.\r\n")
             return
         filepath = os.path.abspath(os.path.join(self.current_dir, filename))
+        if not filepath.startswith(self.base_dir):
+            self.send_response("550 Requested action not taken. Access denied\r\n")
+            return
         if os.path.isfile(filepath) or os.path.isdir(filepath):
             self.rename_from_path = filepath
             self.send_response("350 Requested file action pending further information (Send RNTO).\r\n")
@@ -516,6 +662,9 @@ class ClientSession(threading.Thread):
             self.send_response("501 Syntax error in parameters.\r\n")
             return
         new_filepath = os.path.abspath(os.path.join(self.current_dir, filename))
+        if not new_filepath.startswith(self.base_dir):
+            self.send_response("550 Requested action not taken. Access denied\r\n")
+            return
         try:
             os.rename(self.rename_from_path, new_filepath)
             self.rename_from_path = None  # Reset lại trạng thái
@@ -544,7 +693,27 @@ class ClientSession(threading.Thread):
         if not filename:
             self.send_response("501 Syntax error in parameters.\r\n")
             return
+        if not self.data_sock:
+            self.send_response("425 Use PORT or PASV first.\r\n")
+            return
         filepath = os.path.abspath(os.path.join(self.current_dir, filename))
+        if not filepath.startswith(self.base_dir):
+            self.send_response("550 Requested action not taken. Access denied\r\n")
+            return
+        parent_dir = os.path.dirname(filepath)
+        
+        # Check if that folder actually exists on the server's hard drive
+        if not os.path.exists(parent_dir) or not os.path.isdir(parent_dir):
+            self.send_response("550 Requested action not taken. File unavailable (Directory not found).\r\n")
+            return  
+        if self.data_mode == 'ACTIVE':
+            # Sử dụng self.data_sock đã được tạo trong handle_port
+            syn_header = struct.pack(HEADER_FORMAT, 0, 0, FLAG_SYN, 0)
+            chksum = calculate_checksum(syn_header)
+            final_syn = struct.pack(HEADER_FORMAT, 0, 0, FLAG_SYN, chksum)
+            
+            print(f"[*] Firing Active Mode SYN to Client at {self.client_data_ip}:{self.client_data_port}")
+            self.data_sock.sendto(final_syn, (self.client_data_ip, self.client_data_port))
         self.send_response("150 Ok to send data, appending to file.\r\n")
         # Gọi rdt_recv với mode 'ab' (append binary)
         if self.rdt_recv(filepath, write_mode='ab'):
@@ -557,9 +726,19 @@ class ClientSession(threading.Thread):
 
     def handle_stou(self):
         """STOU: Upload file nhưng Server tự sinh tên file độc nhất để chống ghi đè"""
+        if not self.data_sock:
+            self.send_response("425 Use PORT or PASV first.\r\n")
+            return
         unique_filename = f"upload_{uuid.uuid4().hex[:8]}.dat"
         filepath = os.path.abspath(os.path.join(self.current_dir, unique_filename))
-        self.send_response(f"150 FILE: {unique_filename}\r\n")
+        if self.data_mode == 'ACTIVE':
+            syn_header = struct.pack(HEADER_FORMAT, 0, 0, FLAG_SYN, 0)
+            chksum = calculate_checksum(syn_header)
+            final_syn = struct.pack(HEADER_FORMAT, 0, 0, FLAG_SYN, chksum)
+            
+            print(f"[*] Firing Active Mode SYN to Client at {self.client_data_ip}:{self.client_data_port}")
+            self.data_sock.sendto(final_syn, (self.client_data_ip, self.client_data_port))
+        self.send_response(f"150 Ok to send data. (Unique File: {unique_filename})\r\n")
         if self.rdt_recv(filepath, write_mode='wb'):
             self.send_response("226 Transfer complete.\r\n")
         else:
@@ -573,8 +752,14 @@ class ClientSession(threading.Thread):
         target_path = self.current_dir
         if arg:
             target_path = os.path.abspath(os.path.join(self.current_dir, arg))
+        if not target_path.startswith(self.base_dir):
+            self.send_response("550 Requested action not taken. Access denied\r\n")
+            return
         if not os.path.exists(target_path):
             self.send_response("450 Requested action not taken. Directory unavailable.\r\n")
+            return
+        if not self.data_sock:
+            self.send_response("425 Use PORT or PASV first.\r\n")
             return
         self.send_response("150 File status okay; about to open data connection.\r\n")
         try:
@@ -599,6 +784,9 @@ class ClientSession(threading.Thread):
             self.send_response("501 Syntax error in parameters.\r\n")
             return
         filepath = os.path.abspath(os.path.join(self.current_dir, filename))
+        if not filepath.startswith(self.base_dir):
+            self.send_response("550 Requested action not taken. Access denied\r\n")
+            return
         if os.path.isfile(filepath):
             mtime = os.path.getmtime(filepath)
             # Chuyển đổi timestamp sang định dạng YYYYMMDDhhmmss
